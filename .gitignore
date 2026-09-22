@@ -1,0 +1,5 @@
+data/
+models/
+submissions/
+reports/cv_results.json
+__pycache__/
