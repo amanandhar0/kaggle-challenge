@@ -46,12 +46,12 @@ def _process_holidays(hol: pd.DataFrame) -> pd.DataFrame:
     work_day  = hol[hol["type"] == "Work Day"][["date"]].drop_duplicates()
     transfer  = hol[hol["type"] == "Transfer"][["date"]].drop_duplicates()
 
-    national["holiday_national"]   = True
-    regional["holiday_regional"]   = True
-    local_hol["holiday_local"]     = True
-    bridge["holiday_bridge"]       = True
-    work_day["holiday_work_day"]   = True
-    transfer["holiday_transferred"]= True
+    national["holiday_national"]    = True
+    regional["holiday_regional"]    = True
+    local_hol["holiday_local"]      = True
+    bridge["holiday_bridge"]        = True
+    work_day["holiday_work_day"]    = True
+    transfer["holiday_transferred"] = True
 
     result = national.merge(regional,  on="date", how="outer") \
                      .merge(local_hol, on="date", how="outer") \
@@ -96,21 +96,24 @@ def build_features(
 
     # ── 1. Clip negative sales; log1p transform target ─────────────────────────
     train_df = train_df.copy()
+    test_df  = test_df.copy()
+
     train_df["unit_sales"] = train_df["unit_sales"].clip(lower=0)
     train_df["log_sales"]  = np.log1p(train_df["unit_sales"])
-    train_df["onpromotion"] = train_df["onpromotion"].astype(float).fillna(0)
 
-    test_df = test_df.copy()
-    test_df["onpromotion"] = test_df["onpromotion"].astype(float).fillna(0)
+    promo_map = {"True": 1.0, "False": 0.0, True: 1.0, False: 0.0}
+
+    if "onpromotion" in train_df.columns:
+        train_df["onpromotion"] = train_df["onpromotion"].map(promo_map).fillna(0).astype("float32")
+
+    if "onpromotion" in test_df.columns:
+        test_df["onpromotion"] = test_df["onpromotion"].map(promo_map).fillna(0).astype("float32")
 
     # ── 2. Merge stores & items metadata ──────────────────────────────────────
-    for df in (train_df, test_df):
-        df.merge(side["stores"],  on="store_nbr",  how="left")
-
-    train_df = train_df.merge(side["stores"],  on="store_nbr",  how="left")
-    train_df = train_df.merge(side["items"],   on="item_nbr",   how="left")
-    test_df  = test_df.merge(side["stores"],   on="store_nbr",  how="left")
-    test_df  = test_df.merge(side["items"],    on="item_nbr",   how="left")
+    train_df = train_df.merge(side["stores"], on="store_nbr", how="left")
+    train_df = train_df.merge(side["items"],  on="item_nbr",  how="left")
+    test_df  = test_df.merge(side["stores"],  on="store_nbr", how="left")
+    test_df  = test_df.merge(side["items"],   on="item_nbr",  how="left")
 
     # Perishable map before we go further
     perishable_map = (
@@ -157,11 +160,8 @@ def build_features(
             df[col] = df["date"].map(hol_flags[col]).fillna(False).astype(int)
 
     # ── 7. Lag & rolling features ──────────────────────────────────────────────
-    # Build a pivot: rows = date, cols = (store_nbr, item_nbr)
     print("Computing lag / rolling features (this takes a minute) …")
 
-    # Use only recent history for speed; lags need at most max(LAG_DAYS) look-back
-    # but rolling needs ROLL_WINDOWS too.
     lookback = max(max(LAG_DAYS), max(ROLL_WINDOWS))
 
     pivot = (
@@ -178,7 +178,7 @@ def build_features(
         lag_frames[f"lag_{lag}"] = pivot.shift(lag)
 
     for win in tqdm(ROLL_WINDOWS, desc="Rolling"):
-        shifted = pivot.shift(1)           # avoid leakage: don't include current day
+        shifted = pivot.shift(1)  # avoid leakage: don't include current day
         roll_frames[f"roll_mean_{win}"] = shifted.rolling(win, min_periods=1).mean()
         roll_frames[f"roll_std_{win}"]  = shifted.rolling(win, min_periods=1).std().fillna(0)
 
@@ -188,7 +188,6 @@ def build_features(
         idx = list(zip(df["date"], df["store_nbr"], df["item_nbr"]))
 
         for name, frame in {**lag_frames, **roll_frames}.items():
-            # frame has MultiIndex cols (store_nbr, item_nbr), DatetimeIndex rows
             vals = []
             for d, s, i in idx:
                 try:

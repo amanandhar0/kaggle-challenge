@@ -33,6 +33,24 @@ from metrics import nwrmsle, make_weights
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def load_train_recent(path: Path, dtypes: dict, start_date: str = "2017-01-01") -> pd.DataFrame:
+    """
+    Loads training data filtering for dates >= start_date.
+    Reads in chunks to ensure low peak memory footprint.
+    """
+    print(f"  Reading {path.name} (filtering >= {start_date}) …")
+    chunks = []
+    chunk_size = 10_000_000
+    
+    for chunk in pd.read_csv(path, dtype=dtypes, parse_dates=["date"], chunksize=chunk_size, low_memory=False):
+        chunk = chunk[chunk["date"] >= start_date]
+        if not chunk.empty:
+            chunks.append(chunk)
+            
+    df = pd.concat(chunks, ignore_index=True)
+    return df
+
+
 def load_raw(path: Path, **kwargs) -> pd.DataFrame:
     print(f"  Reading {path.name} …")
     return pd.read_csv(path, parse_dates=["date"], **kwargs)
@@ -40,6 +58,7 @@ def load_raw(path: Path, **kwargs) -> pd.DataFrame:
 
 def save_processed(X_train, y_train, X_test):
     print("Saving processed features to parquet …")
+    DATA_PROC.mkdir(parents=True, exist_ok=True)
     X_train.to_parquet(DATA_PROC / "X_train.parquet", index=False)
     y_train.to_frame("log_sales").to_parquet(DATA_PROC / "y_train.parquet", index=False)
     X_test.to_parquet(DATA_PROC / "X_test.parquet", index=False)
@@ -72,20 +91,24 @@ def main():
 
     # ── 1. Load raw data ───────────────────────────────────────────────────────
     print("\n[1/4] Loading raw CSV files …")
-    # train.csv is ~5 GB; use dtype tricks to save RAM
     dtypes = {
         "store_nbr":    "int8",
         "item_nbr":     "int32",
         "unit_sales":   "float32",
-        "onpromotion":  "object",   # has NaN, read as str then cast
+        "onpromotion":  "object",
     }
-    train_df = load_raw(TRAIN_CSV, dtype=dtypes, low_memory=False)
+    # Load 2017+ data to prevent out-of-memory errors
+    train_df = load_train_recent(TRAIN_CSV, dtypes=dtypes, start_date="2017-01-01")
     test_df  = load_raw(TEST_CSV)
 
-    print(f"  Train shape: {train_df.shape}  |  Test shape: {test_df.shape}")
+    print(f"  Filtered Train shape: {train_df.shape}  |  Test shape: {test_df.shape}")
 
     # ── 2. Feature engineering ─────────────────────────────────────────────────
     print("\n[2/4] Building features …")
+    # Preserve date column before feature construction to ensure split consistency
+    dates_train = train_df["date"].copy().reset_index(drop=True)
+    items_train = train_df["item_nbr"].copy().reset_index(drop=True)
+
     X_train, y_train, X_test, feature_cols, perishable_map = build_features(
         train_df, test_df
     )
@@ -94,22 +117,16 @@ def main():
     # ── 3. Time-series split: last VALIDATION_DAYS rows as hold-out ────────────
     print(f"\n[3/4] Splitting train / validation (last {VALIDATION_DAYS} days) …")
 
-    # We need the original dates to split properly
-    train_dates = train_df["date"].values[-len(X_train):]   # aligned to X_train
-    # Safer: re-derive split date from X_train (which has a 'dayofyear' but not raw date).
-    # Attach date back by merging positionally (features were built from train_df without
-    # reindexing, so order is preserved).
-    split_date = pd.Timestamp(train_df["date"].max()) - pd.Timedelta(days=VALIDATION_DAYS)
-    date_col   = train_df["date"].reset_index(drop=True)
+    split_date = dates_train.max() - pd.Timedelta(days=VALIDATION_DAYS)
 
-    is_val  = date_col > split_date
-    is_tr   = ~is_val
+    is_val = (dates_train > split_date).values
+    is_tr  = ~is_val
 
-    X_tr, y_tr = X_train[is_tr.values], y_train[is_tr.values]
-    X_val, y_val = X_train[is_val.values], y_train[is_val.values]
+    X_tr, y_tr = X_train.iloc[is_tr], y_train.iloc[is_tr]
+    X_val, y_val = X_train.iloc[is_val], y_train.iloc[is_val]
 
     # Build per-sample weights for validation scoring
-    item_col_val = train_df.loc[is_val.values, "item_nbr"].reset_index(drop=True)
+    item_col_val = items_train.iloc[is_val].reset_index(drop=True)
     w_val = make_weights(item_col_val, perishable_map)
 
     print(f"  Train rows : {len(X_tr):,}")
@@ -133,10 +150,12 @@ def main():
     print(fi.head(20).to_string())
 
     # ── 6. Save artifacts ──────────────────────────────────────────────────────
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_path = MODELS_DIR / "lgb_model.pkl"
     joblib.dump(model, model_path)
     print(f"\n  Model saved → {model_path}")
 
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     results = {
         "val_nwrmsle": round(score, 6),
         "best_iteration": int(model.best_iteration_),
